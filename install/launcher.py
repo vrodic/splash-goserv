@@ -329,20 +329,12 @@ def _server(args, model_dir, record):
     # sys.path, and PYTHONPATH names the root. The server holds the assembly
     # the selection link names when it starts, and serves from it until it
     # exits, however an installation advances the link meanwhile.
-    # SPLASH_SERVER=go serves with the Go port of the server (goserver/,
-    # make build/splash-server), which takes the same command line and
-    # holds a fraction of the Python server's memory.
-    if os.environ.get("SPLASH_SERVER") == "go":
-        if not paths.GO_SERVER.exists():
-            raise LauncherError(
-                f"SPLASH_SERVER=go needs {paths.GO_SERVER}: run make build/splash-server",
-                serve_record.INTERNAL,
-            )
-        server = [str(paths.GO_SERVER)]
-    else:
-        server = [str(paths.PYTHON), "-u", "-P", "-m", "server.server"]
     command = [
-        *server,
+        str(paths.PYTHON),
+        "-u",
+        "-P",
+        "-m",
+        "server.server",
         str(model_dir),
         "--model",
         args.model,

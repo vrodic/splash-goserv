@@ -95,6 +95,27 @@ func parseDuration(v string) (float64, bool) {
 	return secs, true
 }
 
+// The server's options that take a value, and its switches.
+var valueFlags = map[string]bool{"--model": true, "--port": true, "--binary": true, "--serve-record": true, "--host": true,
+	"--allowed-host": true, "--allowed-origin": true, "--api-key": true, "--max-memory": true, "--max-context": true,
+	"--ple-memory": true, "--expert-memory": true, "--sparse-kv-memory": true, "--kv-format": true,
+	"--state-format": true, "--idle-release": true, "--max-cache-disk": true, "--max-cache-disk-writes": true,
+	"--cache-dir": true, "--served-model-name": true, "--default-reasoning-effort": true,
+	"--thinking-token-budget": true, "--thinking-end-text": true, "--max-request-size": true,
+	"--max-image-pixels": true, "--request-timeout": true, "--queue-size": true, "--decode-share": true,
+	"--verify-rows": true}
+var switchFlags = map[string]bool{"--no-webui": true, "--persistent-cache": true, "--announce-served-name": true,
+	"--disable-ane": true, "--allow-idle-sleep": true}
+
+// FlagKind says how the server reads option name: as one taking a value, a
+// switch, or not at all.
+func FlagKind(name string) (takesValue, known bool) {
+	if valueFlags[name] {
+		return true, true
+	}
+	return false, switchFlags[name]
+}
+
 // ParseArgs reads argv as argparse does: --flag value or --flag=value.
 func ParseArgs(argv []string) (*Args, error) {
 	a := &Args{Port: 8000, Host: "127.0.0.1", MaxRequest: 128 << 20, QueueSize: 32, MaxImagePixels: maxPixels,
@@ -113,16 +134,7 @@ func ParseArgs(argv []string) (*Args, error) {
 	if v, ok := os.LookupEnv("SPLASH_THINKING_END_TEXT"); ok {
 		a.ThinkingEndText = &v
 	}
-	takes := map[string]bool{"--model": true, "--port": true, "--binary": true, "--serve-record": true, "--host": true,
-		"--allowed-host": true, "--allowed-origin": true, "--api-key": true, "--max-memory": true, "--max-context": true,
-		"--ple-memory": true, "--expert-memory": true, "--sparse-kv-memory": true, "--kv-format": true,
-		"--state-format": true, "--idle-release": true, "--max-cache-disk": true, "--max-cache-disk-writes": true,
-		"--cache-dir": true, "--served-model-name": true, "--default-reasoning-effort": true,
-		"--thinking-token-budget": true, "--thinking-end-text": true, "--max-request-size": true,
-		"--max-image-pixels": true, "--request-timeout": true, "--queue-size": true, "--decode-share": true,
-		"--verify-rows": true}
-	switches := map[string]bool{"--no-webui": true, "--persistent-cache": true, "--announce-served-name": true,
-		"--disable-ane": true, "--allow-idle-sleep": true}
+	takes, switches := valueFlags, switchFlags
 	var positional []string
 	persistent, cacheDir := false, ""
 	var cacheDisk *int64
@@ -355,6 +367,12 @@ func ParseArgs(argv []string) (*Args, error) {
 	if a.Binary == "" {
 		exe, _ := os.Executable()
 		a.Binary = filepath.Join(filepath.Dir(exe), "splash")
+		if _, err := os.Stat(a.Binary); err != nil {
+			// A release keeps the engine in engine/.
+			if alt := filepath.Join(filepath.Dir(filepath.Dir(exe)), "engine", "splash"); fileExists(alt) {
+				a.Binary = alt
+			}
+		}
 	}
 	return a, nil
 }
@@ -716,3 +734,8 @@ func watchProcess(pid int) {
 }
 
 var _ = jinja.Parse
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}

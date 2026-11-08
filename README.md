@@ -1,5 +1,12 @@
 # Splash
 
+> **This fork adds a Go port of Splash's server and `splash` command.**
+> `build/splash-go` (`make go-server`) serves the same engine with the same
+> options and agent commands, using about 85 MB instead of the Python
+> server's 560 MB, and needs no Python for a model that is already prepared.
+> Coverage, memory measurements and what isn't ported yet (the Responses
+> API, images and PDFs) are in [goserver/README.md](goserver/README.md).
+
 [![CI](https://github.com/incoai/splash/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/splash/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Apple%20silicon-black.svg)](#quick-start)

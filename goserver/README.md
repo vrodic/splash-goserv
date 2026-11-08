@@ -6,12 +6,72 @@ engine (`build/splash serve-native`) over the same binary protocol, holding
 a fraction of the Python server's memory.
 
 ```bash
-make build/splash                 # the engine, as before
-make go-server                    # build/splash-server
-SPLASH_SERVER=go ./splash serve --model ... # the launcher runs the Go server
+make build/splash      # the engine
+make go-server         # build/splash-go
 ```
 
-Without `SPLASH_SERVER=go` the launcher runs the Python server, as before.
+## splash-go: the splash command in Go
+
+`build/splash-go` is the Go port of `./splash` (`install/launcher.py` and
+`install/clients.py`). It takes the same commands and options, and runs the
+Go server in its own process:
+
+```bash
+./build/splash-go serve --model Jundot/Qwen3.8-27B-oQ4e-mtp \
+  --model-dir ~/.omlx/models/Jundot/Qwen3.8-27B-oQ4e-mtp \
+  --draft-model ~/.omlx/models/incoai/Qwen3.8-27B-DFlash2 \
+  --max-cache-disk 0 --offline --port 8000
+./build/splash-go claude      # or opencode, codex, hermes, pi; --port PORT; agent args after --
+```
+
+`serve` takes the port's lock and writes its serve record as `./splash`
+does, so the desktop app and a second `serve` see it the same way. It finds
+the model's prepared directory by the selection link the Python installer
+names (`install/models/<OWNER>/<REPO>` or `.selections/<hash>`). Where that
+directory still verifies (each linked file's size and times as `model.json`
+records them), it serves it with no Python at all:
+- **Local files** (`--model-dir`): with `--draft-model`, or with `--offline`.
+- **Hub models:** with `--offline`.
+
+Otherwise, for a model not prepared yet, files that changed, or a Hub model
+online that the installer checks for updates, it runs the Python installer
+once (`install/models.py` or `install/local.py`, which need `.venv`), then
+serves in Go. `./splash` and `install/` are unchanged.
+
+The agent commands write the same configuration and environment as Python's
+`clients.py`. Each agent's argv, environment and written files (OpenCode's
+inline config, Codex's `-c` settings, Hermes's profile `config.yaml`, Pi's
+`models.json`) were compared against `./splash`'s and match. Codex needs the
+Responses API, which the Go server does not serve yet.
+
+## Running the server alone
+
+`splash-go server` is the server alone, without `serve`'s port check, locks,
+serve record or model lookup: `python -m server.server`'s command line, for
+debugging. It needs a model directory Splash has prepared: a selection link in
+`install/models/.selections/` or an assembly in `install/models/.resolved/`.
+Preparing a new model is still the Python installer's job, done once (any
+`./splash serve` run prepares one).
+
+```bash
+ls -l install/models/.selections/     # each link names a prepared model
+./build/splash-go server install/models/.selections/<link> \
+  --model Jundot/Qwen3.8-27B-oQ4e-mtp --max-cache-disk 0 --port 8000
+```
+
+It takes `splash serve`'s server options (`--host`, `--api-key`,
+`--max-context`, `--max-memory`, `--idle-release`, `--queue-size`, …) as
+`python -m server.server` does. `--binary` defaults to the `splash` engine
+beside it, and `--serve-record` is only for the desktop app.
+
+Constrained output loads llguidance from the Python environment's wheel
+library (`.venv/lib/python3*/site-packages/llguidance/_lib.abi3.so`) with
+`dlopen`. That reads a file and runs no Python. `SPLASH_LLGUIDANCE=/path/to/_lib.abi3.so`
+points elsewhere.
+
+Agent clients then connect to it as to `splash serve`, such as Claude Code
+with `ANTHROPIC_BASE_URL=http://127.0.0.1:8000`, or any OpenAI client with
+`http://127.0.0.1:8000/v1`.
 
 ## Memory
 
