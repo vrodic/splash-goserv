@@ -417,6 +417,17 @@ $(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 
+# The Go port of the HTTP server (goserver/), which `SPLASH_SERVER=go splash
+# serve` runs in place of python -m server.server.
+GO ?= go
+GO_SERVER := $(BUILD)/splash-server
+GO_SOURCES := $(shell find goserver -name '*.go' -o -name go.mod -o -name go.sum)
+.PHONY: go-server
+go-server: $(GO_SERVER)
+$(GO_SERVER): $(GO_SOURCES)
+	@mkdir -p $(BUILD)
+	cd goserver && $(GO) build -trimpath -o ../$(GO_SERVER) ./cmd/splash-server
+
 clean:
 	rm -rf $(BUILD)
 

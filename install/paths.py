@@ -9,3 +9,5 @@ MODELS = DATA / "models" if PACKAGED else ROOT / "install/models"
 RUNTIME = DATA / "runtime" if PACKAGED else ROOT / "build/runtime"
 PYTHON = ROOT / ("python/bin/python3" if PACKAGED else ".venv/bin/python")
 BINARY = ROOT / ("engine/splash" if PACKAGED else "build/splash")
+# The Go port of the HTTP server (goserver/), which SPLASH_SERVER=go selects.
+GO_SERVER = ROOT / ("engine/splash-server" if PACKAGED else "build/splash-server")
