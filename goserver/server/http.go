@@ -466,7 +466,7 @@ func (x *exchange) collect(j *Job, cb callbacks) (*Collected, error) {
 	splitter := NewReasoningSplitter(j.Thinking, j.MayCallTools(), j.Format)
 	var projector *Projector
 	if j.ToolPolicy != nil || j.Reasoning != nil {
-		projector = NewProjector(j.ToolPolicy, j.PublicID, false, j.Format.Syntax)
+		projector = NewProjector(j.ToolPolicy, j.PublicID, j.Structured, j.Format.Syntax)
 	}
 	var reasoning, content strings.Builder
 	var result *Result
@@ -709,6 +709,7 @@ func (s *Server) status() *ojson.Object {
 	app.prepMu.Unlock()
 	st.Set("instance", ojson.O("id", s.instanceID, "pid", int64(os.Getpid()), "model", app.Model, "host", s.Host,
 		"port", int64(s.Port), "started_at", float64(s.started.UnixNano())/1e9))
+	st.Set("grammar_cache", app.constraints().Stats())
 	st.Set("http", ojson.O("requests", ojson.O("active", int64(len(s.requests)), "capacity", int64(cap(s.requests))),
 		"max_request_bytes", s.MaxRequest,
 		"token_counts", ojson.O("active", int64(len(s.tokenCounts)), "capacity", int64(cap(s.tokenCounts)))))

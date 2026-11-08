@@ -37,6 +37,11 @@ type Frontend struct {
 	DefaultBudget   *int
 	RequestTimeout  time.Duration // 0 for none
 	Codec           *ThinkingCodec
+	// Constraints compiles grammars once the first constrained request
+	// loads llguidance; nil where it cannot be loaded.
+	Constraints     *ConstraintFactory
+	loadConstraints func() (*ConstraintFactory, error)
+	constraintsOnce sync.Once
 	prepSlots       chan struct{}
 	prepMu          sync.Mutex
 	prepActive      int
@@ -45,6 +50,12 @@ type Frontend struct {
 
 func (f *Frontend) init(capacity int) {
 	f.prepSlots = make(chan struct{}, capacity)
+}
+
+func (f *Frontend) constraints() *ConstraintFactory {
+	f.prepMu.Lock()
+	defer f.prepMu.Unlock()
+	return f.Constraints
 }
 
 func (f *Frontend) MaxContext() int { return int(f.Backend.rt.Capabilities().MaxContext) }
@@ -632,7 +643,8 @@ type prompt struct {
 	preserve       *bool
 	enableThinking *bool
 	kwargs         *ojson.Object
-	responseFormat bool
+	// The response schema, nil without one.
+	responseSchema any
 }
 
 func (f *Frontend) preparePrompt(body *ojson.Object) (*prompt, error) {
@@ -691,13 +703,8 @@ func (f *Frontend) preparePrompt(body *ojson.Object) (*prompt, error) {
 	if err != nil {
 		return nil, err
 	}
-	if rf := body.Value("response_format"); rf != nil {
-		if o, ok := rf.(*ojson.Object); !ok || !(o.Len() == 1 && o.Value("type") == "text") {
-			if _, ok := rf.(*ojson.Object); !ok {
-				return nil, apiErr(400, "response_format must be an object")
-			}
-			p.responseFormat = true
-		}
+	if p.responseSchema, err = normalizeResponseFormat(body.Value("response_format")); err != nil {
+		return nil, err
 	}
 	p.messages, p.tools, p.policy = templateMessages(messages), tools, policy
 	return p, nil
@@ -794,10 +801,10 @@ func (f *Frontend) outputBudget(requested any, promptTokens int, field string) (
 	return room, nil
 }
 
-// errConstrained refuses what only a grammar can do, which the Go server
-// does not implement.
+// errConstrained refuses what only a grammar can do where llguidance could
+// not be loaded.
 func errConstrained(what string) *APIError {
-	return apiErrCode(400, what+" needs constrained decoding, which the Go server does not implement yet", "constraint_unsupported")
+	return apiErrCode(400, what+" needs constrained decoding, and llguidance could not be loaded (see the startup log)", "constraint_unsupported")
 }
 
 // ChatJob prepares a Chat body.
@@ -823,23 +830,44 @@ func (f *Frontend) ChatJob(body *ojson.Object, deadline time.Time, flags uint32,
 		return nil, err
 	}
 	firstCallOnly := false
-	if p.responseFormat {
-		return nil, errConstrained("response_format")
+	// Constrained tool calls and structured output generate under a
+	// grammar, which decides where the output ends; tools beside a response
+	// schema share one.
+	toolConstrained := p.policy != nil && (p.policy.Constrained || p.responseSchema != nil)
+	constrained := toolConstrained || p.responseSchema != nil
+	if opts.IgnoreEOS && constrained {
+		return nil, apiErr(400, "ignore_eos cannot be combined with constrained tool calls, tool_choice none or structured output")
 	}
-	if pol := p.policy; pol != nil && pol.Constrained {
+	if constrained {
+		f.constraintsOnce.Do(func() {
+			if f.loadConstraints == nil {
+				return
+			}
+			factory, err := f.loadConstraints()
+			if err != nil {
+				printStatus("Warning · constrained output is unavailable: "+err.Error(), true)
+				return
+			}
+			f.prepMu.Lock()
+			f.Constraints = factory
+			f.prepMu.Unlock()
+		})
+	}
+	if constrained && f.constraints() == nil {
+		pol := p.policy
 		switch {
+		case p.responseSchema != nil:
+			return nil, errConstrained("response_format")
 		case pol.Required:
 			return nil, errConstrained("tool_choice required or a named tool")
 		case len(pol.Strict) > 0:
 			return nil, errConstrained("a strict tool")
 		case pol.Schemas.Len() == 0:
-			// tool_choice none: the tools stay in the prompt, and any call
-			// the model writes reads as text.
 			p.policy = nil
 		default:
-			// parallel_tool_calls false: the first call is kept.
 			firstCallOnly = true
 		}
+		constrained, toolConstrained = false, false
 	}
 	rendered, err := f.renderPrompt(p, true)
 	if err != nil {
@@ -847,6 +875,25 @@ func (f *Frontend) ChatJob(body *ojson.Object, deadline time.Time, flags uint32,
 	}
 	if err := remaining(deadline); err != nil {
 		return nil, err
+	}
+	var constraint *TokenConstraint
+	if constrained {
+		var grammar string
+		var prefixes func() []prefixCheck
+		if toolConstrained {
+			if grammar, err = toolGrammar(p.policy, rendered.thinking, p.responseSchema, f.Format); err != nil {
+				return nil, err
+			}
+			prefixes = func() []prefixCheck { return f.callOpenings(p.policy, rendered.thinking) }
+		} else {
+			grammar = jsonGrammar(p.responseSchema, rendered.thinking, f.Format)
+		}
+		if constraint, err = f.constraints().Create(grammar, prefixes); err != nil {
+			return nil, err
+		}
+		if err := remaining(deadline); err != nil {
+			return nil, err
+		}
 	}
 	requested := body.Value("max_completion_tokens")
 	if requested == nil {
@@ -881,6 +928,8 @@ func (f *Frontend) ChatJob(body *ojson.Object, deadline time.Time, flags uint32,
 	}
 	job.ToolPolicy = p.policy
 	job.FirstCallOnly = firstCallOnly
+	job.Constraint = constraint
+	job.Structured = p.responseSchema != nil
 	if len(p.tools) > 0 {
 		sum := sha1.Sum([]byte(sortedJSON(p.tools)))
 		job.ToolsCount, job.ToolsSignature = len(p.tools), hex.EncodeToString(sum[:])[:8]
@@ -908,6 +957,26 @@ func (f *Frontend) newJob(opts *GenerationOptions, tokens []int, maxNew int, dea
 	return &Job{Prompt: prompt, MaxNewTokens: maxNew, Seed: opts.Seed, Sampling: opts.Sampling, Deadline: deadline,
 		Priority: opts.Priority, StopSequences: opts.Stops, Flags: flags, CacheSaltLo: opts.SaltLo, CacheSaltHi: opts.SaltHi,
 		PublicID: randomHex(16), Created: time.Now().Unix()}
+}
+
+// callOpenings are the tokens that begin each strict tool's call, after the
+// close of the reasoning the generation prompt opened.
+func (f *Frontend) callOpenings(p *ToolPolicy, thinking bool) []prefixCheck {
+	var out []prefixCheck
+	for _, name := range p.Schemas.Keys() {
+		if !p.Strict[name] {
+			continue
+		}
+		var tokens []uint32
+		if thinking {
+			tokens = append(tokens, uint32(f.Format.ThinkEndID))
+		}
+		for _, id := range f.Tok.Encode(toolCallOpen + f.Format.Syntax.functionOpening(name)) {
+			tokens = append(tokens, uint32(id))
+		}
+		out = append(out, prefixCheck{tokens, "tool " + name + " has too many parameters to constrain"})
+	}
+	return out
 }
 
 // CompletionJob prepares a text completion.

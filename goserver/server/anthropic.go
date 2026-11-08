@@ -170,8 +170,9 @@ func anthropicChat(body *ojson.Object, codec *ThinkingCodec) (*ojson.Object, boo
 	if !ok || !contains([]string{"low", "medium", "high", "xhigh", "max"}, effort) {
 		return nil, false, apiErr(400, "output_config.effort is invalid")
 	}
-	if output.Value("format") != nil || body.Value("output_format") != nil {
-		return nil, false, errConstrained("an output format")
+	responseFormat, err := anthropicResponseFormat(body, output)
+	if err != nil {
+		return nil, false, err
 	}
 	messages, ok := body.Value("messages").([]any)
 	if !ok || len(messages) == 0 {
@@ -210,7 +211,7 @@ func anthropicChat(body *ojson.Object, codec *ThinkingCodec) (*ojson.Object, boo
 	for _, kv := range []struct {
 		k string
 		v any
-	}{{"tools", tools}, {"preserve_thinking", preserve}, {"reasoning_effort", reasoningEffort},
+	}{{"tools", tools}, {"response_format", responseFormat}, {"preserve_thinking", preserve}, {"reasoning_effort", reasoningEffort},
 		{"chat_template_kwargs", body.Value("chat_template_kwargs")}, {"thinking_token_budget", budget}} {
 		if kv.v != nil {
 			if l, isList := kv.v.([]any); isList && l == nil {
@@ -721,4 +722,27 @@ func streamMessages(x *exchange, job *Job, omitted bool) error {
 		return nil
 	}
 	return x.guarded(job, run, func(e *APIError) { x.eventSSE("error", x.errorPayload(e)) })
+}
+
+// anthropicResponseFormat is a Messages request's output format, in
+// output_config.format or output_format, as a Chat response_format.
+func anthropicResponseFormat(body, output *ojson.Object) (any, error) {
+	format, legacy := output.Value("format"), body.Value("output_format")
+	if format != nil && legacy != nil {
+		return nil, apiErr(400, "output_config.format and output_format cannot be combined")
+	}
+	if format == nil {
+		format = legacy
+	}
+	if format == nil {
+		return nil, nil
+	}
+	o, ok := format.(*ojson.Object)
+	if ok && o.Value("type") == "json_schema" {
+		switch o.Value("schema").(type) {
+		case *ojson.Object, bool:
+			return ojson.O("type", "json_schema", "json_schema", ojson.O("schema", o.Value("schema"))), nil
+		}
+	}
+	return nil, apiErr(400, "output format must be a json_schema object with a schema")
 }

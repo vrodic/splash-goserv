@@ -73,6 +73,12 @@ const (
 	FlagReturnProgress = 1 << 1
 )
 
+// Constraint modes.
+const (
+	ConstraintNone      = 0
+	ConstraintTokenMask = 1
+)
+
 // Finish reasons.
 const (
 	FinishStop      = 0
@@ -235,6 +241,18 @@ func CancelFrame(id uint64) []byte { return idFrame(FrameCancel, id) }
 // StopFrame ends a request at a client stop sequence.
 func StopFrame(id uint64) []byte { return idFrame(FrameStop, id) }
 
+// MaskResponseFrame answers a mask request with its rows' words.
+func MaskResponseFrame(requestID, maskID uint64, mask []byte) []byte {
+	buf := make([]byte, FrameHeaderBytes+20+len(mask))
+	header(buf, FrameMaskResponse, 20+len(mask))
+	p := buf[FrameHeaderBytes:]
+	binary.LittleEndian.PutUint64(p[0:], requestID)
+	binary.LittleEndian.PutUint64(p[8:], maskID)
+	binary.LittleEndian.PutUint32(p[16:], uint32(len(mask)/4))
+	copy(p[20:], mask)
+	return buf
+}
+
 // StatusRequestFrame asks for the status JSON.
 func StatusRequestFrame(correlation uint64) []byte { return idFrame(FrameStatusRequest, correlation) }
 
@@ -270,8 +288,10 @@ type (
 		Tokens    []uint32
 	}
 	MaskRequest struct {
-		RequestID uint64
-		MaskID    uint64
+		RequestID    uint64
+		MaskID       uint64
+		WordsPerMask uint32
+		Simulation   []uint32
 	}
 	Done struct {
 		RequestID        uint64
@@ -422,7 +442,15 @@ func decode(ft uint16, p []byte) (any, error) {
 		if err := need(p, 24, "mask_request"); err != nil {
 			return nil, err
 		}
-		return MaskRequest{le.Uint64(p[0:]), le.Uint64(p[8:])}, nil
+		sim, err := words(p[24:], int(le.Uint32(p[20:])), "simulation token")
+		if err != nil {
+			return nil, err
+		}
+		ev := MaskRequest{le.Uint64(p[0:]), le.Uint64(p[8:]), le.Uint32(p[16:]), sim}
+		if ev.RequestID == 0 || ev.MaskID == 0 || ev.WordsPerMask == 0 || len(sim) > MaxSimulation {
+			return nil, fatal("mask request is invalid")
+		}
+		return ev, nil
 	case FrameDone:
 		if err := need(p, 62, "done"); err != nil {
 			return nil, err

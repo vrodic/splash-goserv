@@ -80,7 +80,18 @@ type Call struct {
 	ended      bool
 	endSent    bool
 	rt         *Runtime
+	// masks computes a constrained call's masks for its simulated tokens.
+	masks   func(simulation []uint32) ([]byte, error)
+	maskErr error
 }
+
+// MaskFailed is a token mask that could not be computed.
+type MaskFailed struct {
+	Msg       string
+	Retryable bool
+}
+
+func (e *MaskFailed) Error() string { return e.Msg }
 
 // Runtime is the engine process and its multiplexed protocol stream.
 type Runtime struct {
@@ -106,6 +117,7 @@ type Runtime struct {
 	spawnedAt  time.Time
 	startSecs  float64
 	pendingCap int
+	maskSlots  chan struct{}
 
 	// OnWarming runs when the first engine begins its warm-up runs.
 	OnWarming func()
@@ -116,7 +128,8 @@ type Runtime struct {
 // NewRuntime returns a runtime that launches command (given the first
 // engine's Ready for a relaunch, nil for the first start).
 func NewRuntime(command func(first *wire.Ready) []string, pendingLimit int) *Runtime {
-	return &Runtime{command: command, pending: map[uint64]*Call{}, status: map[uint64]chan wire.StatusJSON{}, pendingCap: pendingLimit}
+	return &Runtime{command: command, pending: map[uint64]*Call{}, status: map[uint64]chan wire.StatusJSON{},
+		pendingCap: pendingLimit, maskSlots: make(chan struct{}, pendingLimit)}
 }
 
 // Capabilities is the latest engine's Ready.
@@ -316,8 +329,29 @@ func (rt *Runtime) dispatch(gen int, ev any) error {
 		call.handler.OnEnd(nil, &RequestFailed{e.Code, e.Message, e.Retryable, int(e.RetryAfter)})
 		return nil
 	case wire.MaskRequest:
+		call := rt.pending[e.RequestID]
+		if call == nil {
+			rt.mu.Unlock()
+			return &EngineError{"protocol_fatal", fmt.Sprintf("native event references unknown request %d", e.RequestID)}
+		}
+		if call.masks == nil {
+			rt.mu.Unlock()
+			return &EngineError{"protocol_fatal", "native requested a token mask for an unconstrained request"}
+		}
+		if call.ended || call.endSent {
+			rt.mu.Unlock()
+			return nil
+		}
+		select {
+		case rt.maskSlots <- struct{}{}:
+		default:
+			rt.mu.Unlock()
+			call.maskFailed(&MaskFailed{"token-mask queue is full", true})
+			return nil
+		}
 		rt.mu.Unlock()
-		return &EngineError{"protocol_fatal", "native requested a token mask for an unconstrained request"}
+		go rt.computeMask(call, e)
+		return nil
 	}
 	var id uint64
 	switch e := ev.(type) {
@@ -361,7 +395,12 @@ func (rt *Runtime) dispatch(gen int, ev any) error {
 			return &EngineError{"protocol_fatal", "DoneEvent counts do not match the request"}
 		}
 		rt.finishLocked(call)
+		maskErr := call.maskErr
 		rt.mu.Unlock()
+		if maskErr != nil {
+			call.handler.OnEnd(nil, maskErr)
+			return nil
+		}
 		done := e
 		call.handler.OnEnd(&done, nil)
 	default:
@@ -433,8 +472,57 @@ func (rt *Runtime) write(frame []byte, gen int) error {
 // ErrPendingLimit is a submission past --queue-size.
 var ErrPendingLimit = errors.New("pending request limit is full")
 
-// Submit writes a request; its events reach handler.
+func (rt *Runtime) computeMask(call *Call, e wire.MaskRequest) {
+	defer func() { <-rt.maskSlots }()
+	rt.mu.Lock()
+	gone := call.ended || call.endSent
+	rt.mu.Unlock()
+	if gone {
+		return
+	}
+	mask, err := call.masks(e.Simulation)
+	if err == nil && len(mask) != 4*int(e.WordsPerMask)*(len(e.Simulation)+1) {
+		err = &MaskFailed{Msg: fmt.Sprintf("mask provider returned %d bytes; expected %d", len(mask), 4*int(e.WordsPerMask)*(len(e.Simulation)+1))}
+	}
+	if err != nil {
+		var mf *MaskFailed
+		if !errors.As(err, &mf) {
+			err = &MaskFailed{Msg: err.Error()}
+		}
+		call.maskFailed(err)
+		return
+	}
+	rt.mu.Lock()
+	gone = call.ended || call.endSent
+	gen := call.generation
+	rt.mu.Unlock()
+	if !gone {
+		_ = rt.write(wire.MaskResponseFrame(call.id, e.MaskID, mask), gen)
+	}
+}
+
+// maskFailed records why the call's constraint failed and cancels it; its
+// Done then ends it with that error.
+func (c *Call) maskFailed(err error) {
+	c.rt.mu.Lock()
+	if c.maskErr == nil && !c.ended {
+		c.maskErr = err
+	}
+	c.rt.mu.Unlock()
+	c.Cancel()
+}
+
+// Submit writes a request; its events reach handler, and a constrained
+// request's mask requests masks.
 func (rt *Runtime) Submit(req *wire.Request, deadline time.Time, handler CallHandler) (*Call, error) {
+	return rt.SubmitConstrained(req, deadline, handler, nil)
+}
+
+// SubmitConstrained is Submit with a mask provider (nil for none).
+func (rt *Runtime) SubmitConstrained(req *wire.Request, deadline time.Time, handler CallHandler, masks func([]uint32) ([]byte, error)) (*Call, error) {
+	if masks != nil {
+		req.Constraint = wire.ConstraintTokenMask
+	}
 	rt.mu.Lock()
 	if rt.closed {
 		rt.mu.Unlock()
@@ -471,7 +559,7 @@ func (rt *Runtime) Submit(req *wire.Request, deadline time.Time, handler CallHan
 		return nil, &RequestFailed{Code: "invalid_request", Msg: err.Error()}
 	}
 	frame := req.Encode()
-	call := &Call{id: req.ID, generation: rt.generation, handler: handler, prompt: len(req.Prompt), logicalMax: int(req.MaxOutputTokens), rt: rt}
+	call := &Call{id: req.ID, generation: rt.generation, handler: handler, prompt: len(req.Prompt), logicalMax: int(req.MaxOutputTokens), rt: rt, masks: masks}
 	rt.pending[req.ID] = call
 	gen := rt.generation
 	rt.mu.Unlock()

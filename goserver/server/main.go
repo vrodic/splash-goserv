@@ -9,12 +9,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"splash/goserver/jinja"
+	"splash/goserver/llg"
 	"splash/goserver/ojson"
 	"splash/goserver/tokenizer"
 	"splash/goserver/wire"
@@ -629,6 +631,19 @@ func Main(argv []string) int {
 		app.RequestTimeout = time.Duration(args.RequestTimeout * float64(time.Second))
 	}
 	app.init(int(served.MaxConcurrent))
+	exeDir, _ := os.Executable()
+	repo := filepath.Dir(filepath.Dir(exeDir))
+	// llguidance's token trie takes about 100 MB, which only constrained
+	// requests need: the first one loads it.
+	app.loadConstraints = func() (*ConstraintFactory, error) {
+		started := time.Now()
+		factory, err := NewConstraintFactory(FindLLGuidance(repo), tok, served)
+		debug.FreeOSMemory()
+		if err == nil {
+			printStatus(fmt.Sprintf("Constraints · llguidance %s loaded in %.1f s", llg.Version(), time.Since(started).Seconds()), false)
+		}
+		return factory, err
+	}
 	exe, _ := os.Executable()
 	root2 := filepath.Dir(filepath.Dir(exe))
 	if _, err := os.Stat(filepath.Join(root2, "server", "chat.html")); err != nil {

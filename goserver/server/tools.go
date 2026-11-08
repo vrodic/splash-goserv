@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
@@ -116,6 +117,10 @@ type ToolPolicy struct {
 	Parallel    bool
 	Strict      map[string]bool
 	Constrained bool
+
+	argOnce sync.Once
+	args    map[string]*argShape
+	argErr  error
 }
 
 // MayCall reports whether a call may be made.
@@ -142,31 +147,48 @@ func NewParameterTypes(p *ToolPolicy) *ParameterTypes {
 	return &ParameterTypes{policy: p, cache: map[string][2]any{}}
 }
 
-// Of returns the types of tool name's declared parameters and of any other.
+// Of returns the types of tool name's declared parameters and of any other:
+// a strict tool's as its grammar generates them, any other's read against
+// its schema as framed.
 func (pt *ParameterTypes) Of(name string) (map[string]typeSet, typeSet) {
 	if c, ok := pt.cache[name]; ok {
-		return c[0].(map[string]typeSet), nil
+		other, _ := c[1].(typeSet)
+		return c[0].(map[string]typeSet), other
 	}
 	params := map[string]typeSet{}
-	schema, _ := pt.policy.Schemas.Value(name).(*ojson.Object)
-	if schema != nil {
-		reader := newTypeReader(schema)
-		if props, ok := schema.Value("properties").(*ojson.Object); ok {
-			for _, k := range props.Keys() {
-				params[k] = reader.read(props.Value(k))
-			}
+	var other typeSet
+	var shape *argShape
+	var read func(any) typeSet
+	if pt.policy.Strict[name] {
+		if args, err := pt.policy.ArgumentSchemas(); err == nil {
+			shape = args[name]
 		}
+		// A framed value is a schema of its own.
+		read = func(v any) typeSet { return newTypeReader(v).read(v) }
+	} else if schema := jsonTypeNames(pt.policy.Schemas.Value(name)); schema != nil {
+		budget := maxFramedSchemaBytes
+		if s, err := argumentShape(schema, &budget); err == nil {
+			shape = s
+		}
+		reader := newTypeReader(schema)
+		read = reader.read
 	}
-	pt.cache[name] = [2]any{params, nil}
-	return params, nil
+	if shape != nil {
+		for _, k := range shape.props.Keys() {
+			params[k] = read(shape.props.Value(k))
+		}
+		other = read(shape.additional)
+	}
+	pt.cache[name] = [2]any{params, other}
+	return params, other
 }
 
 type typeReader struct {
-	root *ojson.Object
+	root any
 	seen map[*ojson.Object]bool
 }
 
-func newTypeReader(root *ojson.Object) *typeReader {
+func newTypeReader(root any) *typeReader {
 	return &typeReader{root: root, seen: map[*ojson.Object]bool{}}
 }
 
@@ -264,10 +286,11 @@ func (r *typeReader) read(node any) typeSet {
 				}
 			}
 		} else {
-			members, _ := obj.Value("anyOf").([]any)
-			if members == nil {
-				members, _ = obj.Value("oneOf").([]any)
+			raw := obj.Value("anyOf")
+			if !obj.Has("anyOf") {
+				raw = obj.Value("oneOf")
 			}
+			members, _ := raw.([]any)
 			if len(members) > 0 {
 				var union typeSet
 				for _, m := range members {
@@ -285,8 +308,8 @@ func (r *typeReader) read(node any) typeSet {
 		}
 	}
 	all, _ := obj.Value("allOf").([]any)
-	if ref, ok := obj.Value("$ref").(string); ok {
-		if target := r.resolve(ref); target != nil {
+	if obj.Has("$ref") {
+		if target := referenced(obj, r.root); target != nil {
 			all = append(append([]any(nil), all...), target)
 		}
 	}
@@ -294,26 +317,6 @@ func (r *typeReader) read(node any) typeSet {
 		result = narrowed(result, r.read(m))
 	}
 	return result
-}
-
-func (r *typeReader) resolve(ref string) any {
-	if !strings.HasPrefix(ref, "#") {
-		return nil
-	}
-	var node any = r.root
-	path := strings.TrimPrefix(ref, "#")
-	if path == "" {
-		return node
-	}
-	for _, part := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
-		part = strings.ReplaceAll(strings.ReplaceAll(part, "~1", "/"), "~0", "~")
-		obj, ok := node.(*ojson.Object)
-		if !ok {
-			return nil
-		}
-		node = obj.Value(part)
-	}
-	return node
 }
 
 var pythonLiterals = map[string]any{"True": true, "False": false, "None": nil}
@@ -471,7 +474,11 @@ func normalizeTools(tools, toolChoice, parallel any) ([]any, *ToolPolicy, error)
 				return nil, nil, apiErr(400, "strict must be a boolean for tool "+n)
 			}
 		}
-		if !checkDepth(schema, 1) {
+		if strict == true {
+			if err := checkStrictTool(n, schema); err != nil {
+				return nil, nil, err
+			}
+		} else if !checkDepth(schema, 1) {
 			schema = nil
 		}
 		schemas.Set(n, schema)
@@ -507,6 +514,15 @@ func normalizeTools(tools, toolChoice, parallel any) ([]any, *ToolPolicy, error)
 	for k := range marked {
 		if schemas.Has(k) {
 			strict[k] = true
+			// A strict tool's schema compiles into its grammar, so its
+			// references must resolve.
+			for _, node := range subschemas(schemas.Value(k)) {
+				if obj, ok := node.(*ojson.Object); ok && obj.Has("$ref") {
+					if _, err := lookupRef(obj.Value("$ref"), schemas.Value(k)); err != nil {
+						return nil, nil, err
+					}
+				}
+			}
 		}
 	}
 	return offered, &ToolPolicy{Schemas: schemas, Required: choice != "auto", Parallel: par, Strict: strict,

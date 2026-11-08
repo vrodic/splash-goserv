@@ -225,13 +225,17 @@ type Job struct {
 	PublicID         string
 	Created          int64
 	FirstCallOnly    bool
-	cache            CacheInfo
-	cacheMu          sync.Mutex
-	events           *eventQueue
-	call             *Call
-	cancelled        bool
-	callMu           sync.Mutex
-	started          time.Time
+	// The grammar the output generates under, nil for none, and whether
+	// the output answers a response schema.
+	Constraint *TokenConstraint
+	Structured bool
+	cache      CacheInfo
+	cacheMu    sync.Mutex
+	events     *eventQueue
+	call       *Call
+	cancelled  bool
+	callMu     sync.Mutex
+	started    time.Time
 }
 
 func (j *Job) MayCallTools() bool { return j.ToolPolicy.MayCall() }
@@ -389,6 +393,17 @@ func (h *jobHandler) OnTokens(e wire.Tokens) {
 	if e.Offset == 0 {
 		h.firstBatch = len(e.Tokens)
 	}
+	if c := h.job.Constraint; c != nil {
+		if err := c.Commit(e.Tokens); err != nil {
+			h.job.callMu.Lock()
+			call := h.job.call
+			h.job.callMu.Unlock()
+			if call != nil {
+				go call.maskFailed(&MaskFailed{Msg: err.Error()})
+			}
+			return
+		}
+	}
 	h.streamer.putTokens(e.Tokens)
 }
 
@@ -399,6 +414,15 @@ func (h *jobHandler) OnEnd(done *wire.Done, err error) {
 		h.b.logEnd(job, nil, apiError)
 		job.events.put(event{kind: "error", err: apiError})
 		return
+	}
+	if c := job.Constraint; c != nil && done.Reason != wire.FinishCancelled && h.streamer.stopSeq == nil {
+		// The grammar checks what was generated after the last mask.
+		if err := c.Finish(); err != nil {
+			apiError := apiErrCode(400, err.Error(), "constraint_error")
+			h.b.logEnd(job, nil, apiError)
+			job.events.put(event{kind: "error", err: apiError})
+			return
+		}
 	}
 	if err := h.streamer.end(); err != nil {
 		apiError := apiErrCode(500, err.Error(), "runtime_error")
@@ -569,8 +593,18 @@ func (b *Backend) Submit(j *Job) error {
 	req := &wire.Request{Priority: j.Priority, MaxOutputTokens: uint32(j.MaxNewTokens), Prompt: j.Prompt,
 		Sampling: j.Sampling, Seed: j.Seed, GenerationPromptTokens: uint32(j.GenerationPrompt), Flags: j.Flags,
 		CacheSaltLo: j.CacheSaltLo, CacheSaltHi: j.CacheSaltHi, Thinking: b.thinkingBudget(j)}
+	var masks func([]uint32) ([]byte, error)
+	if c := j.Constraint; c != nil {
+		masks = func(sim []uint32) ([]byte, error) {
+			m, err := c.Masks(sim)
+			if err != nil {
+				return nil, &MaskFailed{Msg: err.Error()}
+			}
+			return m, nil
+		}
+	}
 	j.callMu.Lock()
-	call, err := b.rt.Submit(req, j.Deadline, h)
+	call, err := b.rt.SubmitConstrained(req, j.Deadline, h, masks)
 	if err == nil {
 		j.call = call
 		if j.cancelled {
@@ -629,6 +663,13 @@ func (b *Backend) apiError(err error) *APIError {
 			e.RetryAfter = rf.RetryAfter
 		}
 		return e
+	case errors.As(err, new(*MaskFailed)):
+		var mf *MaskFailed
+		errors.As(err, &mf)
+		if mf.Retryable {
+			return apiErrCode(503, mf.Msg, "runtime_busy")
+		}
+		return apiErrCode(400, mf.Msg, "constraint_error")
 	case errors.Is(err, ErrPendingLimit):
 		return apiErrCode(503, "request queue is full", "frontend_overloaded")
 	case errors.Is(err, errTimeout):

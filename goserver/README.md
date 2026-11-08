@@ -26,6 +26,11 @@ chats with prompts of about 15k tokens, plus 4 Messages requests with tools
 | RSS, idle after start | 634 MB | 8–18 MB |
 | peak RSS under load | 674 MB | 71 MB |
 | peak footprint under load | 559 MB | 84 MB |
+| footprint after a constrained request | (included above) | 208 MB |
+
+llguidance's token trie for the 248k-token vocabulary takes about 120 MB,
+so the Go server loads it on the first constrained request (about 0.4 s)
+rather than at startup, as the Python server does.
 
 ## What it covers
 
@@ -47,16 +52,35 @@ chats with prompts of about 15k tokens, plus 4 Messages requests with tools
   are bit-identical to Python's, so `--persistent-cache` entries carry over.
   So do thinking signatures, which use Fernet under the shared key.
 - Host, origin and API-key checks, and both error shapes.
+- Constrained output, as in `constraints.py` and `tool_schema.py`:
+  JSON-schema and `json_object` response formats, Anthropic output formats,
+  `tool_choice` required, named and none, `parallel_tool_calls: false`, and
+  `strict` tools. The grammars match Python's byte for byte
+  (`parity/grammar_parity.py`). The server answers the engine's mask
+  requests, draft rows included, and checks generated tokens against the
+  grammar.
+
+## llguidance
+
+`llg/` drives llguidance through its C API (`llguidance.h`, v1.8.0 from
+github.com/guidance-ai/llguidance, MIT). The library is the one the Python
+environment already ships, loaded with `dlopen` at run time:
+`.venv/lib/python3*/site-packages/llguidance/_lib.abi3.so`, `python/...` in a
+packaged install, or `SPLASH_LLGUIDANCE`. That wheel is a CPython
+extension, so `llg/pystubs.c` defines the 96 CPython symbols it imports.
+They are never called, since only the `llg_*` C functions are used. Without
+the library, constrained requests answer 400 `constraint_unsupported` and
+everything else still works.
 
 ## Not yet ported
 
 These answer with a 400 or 501 that says the Go server does not implement
 them:
 
-- Grammar-constrained output: `response_format` JSON schemas,
-  `tool_choice: required`/named tools and `strict` tools, which need
-  llguidance. `parallel_tool_calls: false` keeps the first call, and
-  `tool_choice: none` reads any call as text, without a grammar.
+- Checking a structured answer against its schema after generation. The
+  grammar already enforces the schema, except for keywords it leaves out,
+  such as look-around patterns. Meta-validation of schemas checks only
+  `type` names, which are what Python's `check_schema` usually reports.
 - Images and PDFs. The server reports `vision: false`.
 - `/v1/responses`, `/v1/judgments` and `/v1/systemone`.
 - Prompt-prefix token reuse (`tokenization.PromptTokenizer`). Prompts are
@@ -67,13 +91,24 @@ them:
 Run these from the repository root with `.venv` and the model's files:
 
 ```bash
-cd goserver && go build -o ../build/tokcheck ./cmd/tokcheck && go build -o ../build/tplcheck ./cmd/tplcheck && cd ..
+cd goserver && for c in tokcheck tplcheck grammarcheck; do go build -o ../build/$c ./cmd/$c; done && cd ..
 .venv/bin/python goserver/parity/tokenizer_parity.py MODEL_DIR   # vs tokenizers
 PYTHONPATH=. .venv/bin/python goserver/parity/template_parity.py MODEL_DIR
+PYTHONPATH=. .venv/bin/python goserver/parity/grammar_parity.py MODEL_DIR
 ```
 
-At the time of the port: 4,979 strings with 0 token mismatches, and 8,050
-template renders with 0 mismatches.
+At the time of the port: 4,979 strings with 0 token mismatches, 8,050
+template renders with 0 mismatches, and 2,216 grammars with 0 mismatches.
+
+The Go server handles two constraint cases explicitly (not yet checked
+against the Python server):
+- A speculative token batch can carry the grammar's last tokens and the EOS
+  together, and llguidance's bulk consume refuses the EOS once the grammar
+  has stopped. The Go server consumes the batch up to the EOS, then accepts
+  the EOS after a finished grammar.
+- A mask's draft rows are computed on a copy of the matcher, because a
+  refused draft token leaves a matcher in an error state that rollback does
+  not clear.
 
 One known difference: transformers 5 rebuilds Qwen2Tokenizer's
 pre-tokenizer with the older Qwen2 regex, which lacks `\p{M}`. The Python
